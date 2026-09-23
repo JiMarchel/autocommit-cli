@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["git", "commit", "gemini", "conventional-commits", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-# repository = "https://github.com/<user>/autocommit"
+repository = "https://github.com/JiMarchel/autocommit-cli"
 exclude = ["/docs", "/AGENTS.md", "/.github"]
 
 [[bin]]
