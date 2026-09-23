@@ -2,8 +2,7 @@
 
 use crate::diff::{self, FileChange};
 use anyhow::{Context, Result, bail};
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 fn git(args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -50,20 +49,29 @@ pub fn staged_changes() -> Result<Vec<FileChange>> {
     Ok(diff::parse(&name_status, &numstat, &patch))
 }
 
-/// Commit with `message` read from stdin; hooks still run.
-pub fn commit(message: &str) -> Result<()> {
-    let mut child = Command::new("git")
-        .args(["commit", "--cleanup=strip", "-F", "-"])
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("failed to run git commit")?;
-    child
-        .stdin
-        .take()
-        .context("no stdin for git commit")?
-        .write_all(message.as_bytes())?;
-    let status = child.wait()?;
+/// Commit with `message`; hooks still run. With `edit`, git opens its own
+/// configured editor (GIT_EDITOR / core.editor / VISUAL / EDITOR) on the
+/// message first, which works the same on Linux, macOS and Windows.
+pub fn commit(message: &str, edit: bool) -> Result<()> {
+    // `-F -` with `-e` would make git's editor fight us for stdin, so hand the
+    // message over in a private temp file instead.
+    let dir = tempfile::Builder::new()
+        .prefix("acm-")
+        .tempdir()
+        .context("failed to create a temp dir")?;
+    let path = dir.path().join("COMMIT_MSG");
+    std::fs::write(&path, format!("{message}\n"))?;
+
+    let mut cmd = Command::new("git");
+    cmd.args(["commit", "--cleanup=strip", "-F"]).arg(&path);
+    if edit {
+        cmd.arg("--edit");
+    }
+    let status = cmd.status().context("failed to run git commit")?;
     if !status.success() {
+        if edit {
+            bail!("git commit aborted or failed ({status}); nothing committed");
+        }
         bail!("git commit failed ({status})");
     }
     Ok(())

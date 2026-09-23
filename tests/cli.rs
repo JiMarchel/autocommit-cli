@@ -9,11 +9,21 @@ use std::thread;
 
 const BIN: &str = env!("CARGO_BIN_EXE_acm");
 
+/// An empty global git config (portable replacement for `/dev/null`).
+fn empty_gitconfig() -> &'static Path {
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let p = std::env::temp_dir().join(format!("acm-test-gitconfig-{}", std::process::id()));
+        std::fs::write(&p, "").unwrap();
+        p
+    })
+}
+
 /// Base command for the binary, isolated from the developer's real config.
 fn acm(dir: &Path) -> Command {
     let mut cmd = Command::new(BIN);
     cmd.current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", empty_gitconfig())
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("AUTOCOMMIT_RETRY_DELAY_MS", "0")
         .env("AUTOCOMMIT_CONFIG", dir.join(".no-such-config.yaml"))
@@ -119,7 +129,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", empty_gitconfig())
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .unwrap();
@@ -147,8 +157,13 @@ fn stage(dir: &Path, path: &str, content: &str) {
 }
 
 fn run(dir: &Path, mock: Option<&MockGemini>, args: &[&str]) -> Output {
+    run_with(dir, mock, args, &[])
+}
+
+fn run_with(dir: &Path, mock: Option<&MockGemini>, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = acm(dir);
     cmd.args(args).env("GEMINI_API_KEY", "test-key-123");
+    cmd.envs(envs.iter().copied());
     match mock {
         Some(m) => cmd.env("GEMINI_BASE_URL", &m.url),
         // Nothing listens here: any request fails fast.
@@ -281,11 +296,16 @@ fn missing_api_key_is_a_clear_error() {
 }
 
 fn write_config(dir: &Path, text: &str, mode: u32) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("cfg").join("config.yaml");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, text).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
     path
 }
 
@@ -351,6 +371,7 @@ fn env_and_flag_override_config_file() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn world_readable_config_warns() {
     let dir = repo();
@@ -408,9 +429,12 @@ fn init_writes_private_config_template() {
     assert!(out.status.success(), "{}", stderr(&out));
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains("api_key:"), "{text}");
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 
     // Never overwrite an existing config.
     std::fs::write(&path, "api_key: mine\n").unwrap();
@@ -530,6 +554,7 @@ fn locked_type_is_enforced_without_extra_request() {
     assert!(mock.requests()[0].prompt().contains("MUST be \"docs\""));
 }
 
+#[cfg(unix)]
 #[test]
 fn non_ascii_paths_and_prefix_configs_keep_their_diff() {
     let dir = repo();
@@ -569,7 +594,7 @@ fn unmerged_index_fails_without_calling_api() {
     let _ = Command::new("git")
         .args(["merge", "-q", "other"])
         .current_dir(dir.path())
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", empty_gitconfig())
         .output()
         .unwrap();
 
@@ -578,6 +603,45 @@ fn unmerged_index_fails_without_calling_api() {
 
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("unmerged"), "{}", stderr(&out));
+}
+
+#[test]
+fn edit_flag_opens_git_editor_then_commits() {
+    let dir = repo();
+    stage(dir.path(), "src/a.rs", "x\n");
+    let mock = MockGemini::start(vec![ok("fix: handle x")]);
+
+    // `-i.bak` works with both GNU sed and BSD/macOS sed; Git for Windows ships sed.
+    let out = run_with(
+        dir.path(),
+        Some(&mock),
+        &["--edit"],
+        &[("GIT_EDITOR", "sed -i.bak -e s/handle/rework/")],
+    );
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        git(dir.path(), &["log", "-1", "--format=%B"]).trim(),
+        "fix: rework x"
+    );
+}
+
+#[test]
+fn emptied_message_in_editor_aborts_commit() {
+    let dir = repo();
+    stage(dir.path(), "src/a.rs", "x\n");
+    let mock = MockGemini::start(vec![ok("fix: handle x")]);
+
+    let out = run_with(
+        dir.path(),
+        Some(&mock),
+        &["--edit"],
+        &[("GIT_EDITOR", "sed -i.bak -e d")],
+    );
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("aborted"), "{}", stderr(&out));
+    assert_eq!(commit_count(dir.path()), 0);
 }
 
 #[test]

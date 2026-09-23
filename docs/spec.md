@@ -20,7 +20,7 @@ autocommit [--yes] [--dry-run] [--model <name>]
 - Reads only staged changes (`git diff --cached`). Never runs `git add`.
 - Default (interactive TTY): print message, prompt
   `[y]es commit / [e]dit / [r]egenerate / [n]o`.
-  - `e` opens `$VISUAL` / `$EDITOR` (fallback `vi`) on a temp file.
+  - `e` (or `--edit`): `git commit -F <tmp> --edit`, i.e. git's own editor (portable, incl. Windows).
 - `--yes`: commit without prompting.
 - `--dry-run`: print the message to stdout, never commit.
 - Non-TTY stdin without `--yes`/`--dry-run`: error (no silent hang).

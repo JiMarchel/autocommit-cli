@@ -10,7 +10,7 @@ mod prompt;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::io::{BufRead, IsTerminal, Write};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::time::Duration;
 
 /// Generate a Conventional Commit message for the staged changes using Gemini.
@@ -18,18 +18,22 @@ use std::time::Duration;
 #[command(name = "acm", version, about)]
 struct Cli {
     /// Commit immediately without asking.
-    #[arg(short, long, conflicts_with = "dry_run")]
+    #[arg(short, long, conflicts_with_all = ["dry_run", "edit"])]
     yes: bool,
 
     /// Only print the generated message; never commit.
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, conflicts_with = "edit")]
     dry_run: bool,
+
+    /// Open the generated message in git's editor, then commit.
+    #[arg(short, long)]
+    edit: bool,
 
     /// Gemini model name [env: AUTOCOMMIT_MODEL] [default: gemini-3.1-flash-lite].
     #[arg(short, long)]
     model: Option<String>,
 
-    /// Create a config file template (~/.config/autocommit/config.yaml) and exit.
+    /// Create a config file template and exit (see README for its location).
     #[arg(long, exclusive = true)]
     init: bool,
 }
@@ -48,7 +52,9 @@ fn run(cli: Cli) -> Result<()> {
     let env = |k: &str| std::env::var(k).ok();
     let config_path = config::default_path(env);
     if cli.init {
-        let path = config_path.context("cannot determine the config path (HOME is not set)")?;
+        let path = config_path.context(
+            "cannot determine the config path (set HOME, or APPDATA on Windows, or AUTOCOMMIT_CONFIG)",
+        )?;
         config::init(&path)?;
         eprintln!("created {}; put your api_key there", path.display());
         return Ok(());
@@ -62,7 +68,7 @@ fn run(cli: Cli) -> Result<()> {
     if files.iter().any(|f| f.status == diff::Status::Unmerged) {
         bail!("the index has unmerged paths; resolve the conflicts and `git add` them first");
     }
-    let interactive = !cli.yes && !cli.dry_run;
+    let interactive = !cli.yes && !cli.dry_run && !cli.edit;
     if interactive && !std::io::stdin().is_terminal() {
         bail!("stdin is not a terminal; use --yes to commit or --dry-run to print");
     }
@@ -89,8 +95,8 @@ fn run(cli: Cli) -> Result<()> {
         println!("{msg}");
         return Ok(());
     }
-    if cli.yes {
-        return git::commit(&msg);
+    if cli.yes || cli.edit {
+        return git::commit(&msg, cli.edit);
     }
 
     loop {
@@ -102,15 +108,8 @@ fn run(cli: Cli) -> Result<()> {
             bail!("aborted");
         }
         match answer.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" | "" => return git::commit(&msg),
-            "e" | "edit" => {
-                let edited = edit(&msg)?;
-                if edited.trim().is_empty() {
-                    eprintln!("empty message, keeping the previous one");
-                } else {
-                    msg = edited;
-                }
-            }
+            "y" | "yes" | "" => return git::commit(&msg, false),
+            "e" | "edit" => return git::commit(&msg, true),
             "r" | "regenerate" => msg = generator.generate()?,
             "n" | "no" | "q" => {
                 eprintln!("aborted, nothing committed");
@@ -119,36 +118,4 @@ fn run(cli: Cli) -> Result<()> {
             other => eprintln!("unknown answer {other:?}"),
         }
     }
-}
-
-/// Open `$VISUAL` / `$EDITOR` (fallback `vi`) on the message.
-fn edit(msg: &str) -> Result<String> {
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".to_string());
-    // Private (0700), unpredictable dir: no symlink planting in /tmp.
-    let dir = tempfile::Builder::new()
-        .prefix("autocommit-")
-        .tempdir()
-        .context("failed to create a temp dir for the editor")?;
-    let path = dir.path().join("COMMIT_EDITMSG");
-    std::fs::write(&path, format!("{msg}\n"))?;
-    // Run through the shell so EDITOR="code --wait" works.
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"$1\""))
-        .arg("sh")
-        .arg(&path)
-        .status()
-        .with_context(|| format!("failed to start editor {editor:?}"))?;
-    if !status.success() {
-        bail!("editor exited with {status}");
-    }
-    Ok(std::fs::read_to_string(&path)?
-        .lines()
-        .filter(|l| !l.starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string())
 }

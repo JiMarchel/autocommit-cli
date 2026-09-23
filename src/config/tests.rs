@@ -82,19 +82,51 @@ fn missing_key_error_mentions_both_sources() {
     assert!(err.contains("api_key"), "{err}");
 }
 
+fn cfg_under(base: &str) -> PathBuf {
+    PathBuf::from(base).join("autocommit").join("config.yaml")
+}
+
 #[test]
-fn default_path_follows_xdg() {
-    let p = default_path(env(&[("XDG_CONFIG_HOME", "/x/cfg"), ("HOME", "/home/u")])).unwrap();
-    assert_eq!(p, std::path::PathBuf::from("/x/cfg/autocommit/config.yaml"));
-    let p = default_path(env(&[("HOME", "/home/u")])).unwrap();
+fn unix_path_follows_xdg_then_home() {
+    let unix = |pairs: &[(&str, &str)]| default_path_for(env(pairs), false);
     assert_eq!(
-        p,
-        std::path::PathBuf::from("/home/u/.config/autocommit/config.yaml")
+        unix(&[("XDG_CONFIG_HOME", "/x/cfg"), ("HOME", "/home/u")]),
+        Some(cfg_under("/x/cfg"))
     );
-    let p = default_path(env(&[
-        ("AUTOCOMMIT_CONFIG", "/etc/acm.yaml"),
-        ("HOME", "/h"),
-    ]))
-    .unwrap();
-    assert_eq!(p, std::path::PathBuf::from("/etc/acm.yaml"));
+    assert_eq!(
+        unix(&[("HOME", "/home/u"), ("APPDATA", "/ignored")]),
+        Some(cfg_under("/home/u/.config"))
+    );
+    assert_eq!(
+        unix(&[("AUTOCOMMIT_CONFIG", "/etc/acm.yaml"), ("HOME", "/h")]),
+        Some(PathBuf::from("/etc/acm.yaml"))
+    );
+    assert_eq!(unix(&[]), None);
+}
+
+#[test]
+fn windows_path_uses_appdata_even_when_home_is_set() {
+    let win = |pairs: &[(&str, &str)]| default_path_for(env(pairs), true);
+    let appdata = r"C:\Users\k\AppData\Roaming";
+    // Git Bash sets HOME; PowerShell does not. Both must find the same file.
+    assert_eq!(
+        win(&[("APPDATA", appdata), ("HOME", "/c/Users/k")]),
+        Some(cfg_under(appdata))
+    );
+    assert_eq!(win(&[("APPDATA", appdata)]), Some(cfg_under(appdata)));
+    assert_eq!(
+        win(&[("USERPROFILE", r"C:\Users\k")]),
+        Some(cfg_under(&format!(
+            r"C:\Users\k{}.config",
+            std::path::MAIN_SEPARATOR
+        )))
+    );
+    assert_eq!(
+        win(&[("AUTOCOMMIT_CONFIG", r"D:\acm.yaml"), ("APPDATA", appdata)]),
+        Some(PathBuf::from(r"D:\acm.yaml"))
+    );
+    assert_eq!(
+        win(&[("XDG_CONFIG_HOME", r"D:\cfg"), ("APPDATA", appdata)]),
+        Some(cfg_under(r"D:\cfg"))
+    );
 }

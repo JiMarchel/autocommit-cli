@@ -107,15 +107,32 @@ impl Config {
     }
 }
 
-/// `$AUTOCOMMIT_CONFIG`, else `$XDG_CONFIG_HOME/autocommit/config.yaml`,
-/// else `~/.config/autocommit/config.yaml`.
+/// Config path for the current OS; see `default_path_for`.
 pub fn default_path(env: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    default_path_for(env, cfg!(windows))
+}
+
+/// 1. `$AUTOCOMMIT_CONFIG`
+/// 2. `$XDG_CONFIG_HOME/autocommit/config.yaml`
+/// 3. Linux/macOS: `$HOME/.config/autocommit/config.yaml`
+///    Windows: `%APPDATA%\autocommit\config.yaml`, else
+///    `%USERPROFILE%\.config\autocommit\config.yaml`. HOME is ignored on
+///    Windows so Git Bash and PowerShell resolve to the same file.
+pub fn default_path_for(env: impl Fn(&str) -> Option<String>, windows: bool) -> Option<PathBuf> {
     if let Some(p) = non_blank(env("AUTOCOMMIT_CONFIG")) {
         return Some(PathBuf::from(p));
     }
     let base = non_blank(env("XDG_CONFIG_HOME"))
         .map(PathBuf::from)
-        .or_else(|| non_blank(env("HOME")).map(|h| PathBuf::from(h).join(".config")))?;
+        .or_else(|| {
+            if windows {
+                non_blank(env("APPDATA")).map(PathBuf::from).or_else(|| {
+                    non_blank(env("USERPROFILE")).map(|h| PathBuf::from(h).join(".config"))
+                })
+            } else {
+                non_blank(env("HOME")).map(|h| PathBuf::from(h).join(".config"))
+            }
+        })?;
     Some(base.join("autocommit").join("config.yaml"))
 }
 
