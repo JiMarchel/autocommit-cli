@@ -26,7 +26,7 @@ autocommit [--yes] [--dry-run] [--model <name>]
 - Non-TTY stdin without `--yes`/`--dry-run`: error (no silent hang).
 - Commit via `git commit -F <tmpfile>` (hooks still run).
 
-## Config (env)
+## Config (flag > env > ~/.config/autocommit/config.yaml > default)
 - `GEMINI_API_KEY` (required unless no API call is made)
 - `AUTOCOMMIT_MODEL` (default `gemini-3.1-flash-lite`; `--model` wins)
 - `GEMINI_BASE_URL` (default `https://generativelanguage.googleapis.com`;

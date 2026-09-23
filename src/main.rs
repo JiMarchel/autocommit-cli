@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod diff;
 mod gemini;
 mod git;
@@ -14,7 +15,7 @@ use std::time::Duration;
 
 /// Generate a Conventional Commit message for the staged changes using Gemini.
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(name = "acm", version, about)]
 struct Cli {
     /// Commit immediately without asking.
     #[arg(short, long, conflicts_with = "dry_run")]
@@ -24,22 +25,35 @@ struct Cli {
     #[arg(short = 'n', long)]
     dry_run: bool,
 
-    /// Gemini model name.
-    #[arg(short, long, env = "AUTOCOMMIT_MODEL", default_value = gemini::DEFAULT_MODEL)]
-    model: String,
+    /// Gemini model name [env: AUTOCOMMIT_MODEL] [default: gemini-3.1-flash-lite].
+    #[arg(short, long)]
+    model: Option<String>,
+
+    /// Create a config file template (~/.config/autocommit/config.yaml) and exit.
+    #[arg(long, exclusive = true)]
+    init: bool,
 }
 
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("autocommit: error: {e:#}");
+            eprintln!("acm: error: {e:#}");
             ExitCode::FAILURE
         }
     }
 }
 
 fn run(cli: Cli) -> Result<()> {
+    let env = |k: &str| std::env::var(k).ok();
+    let config_path = config::default_path(env);
+    if cli.init {
+        let path = config_path.context("cannot determine the config path (HOME is not set)")?;
+        config::init(&path)?;
+        eprintln!("created {}; put your api_key there", path.display());
+        return Ok(());
+    }
+
     git::ensure_repo()?;
     let files = git::staged_changes()?;
     if files.is_empty() {
@@ -53,22 +67,19 @@ fn run(cli: Cli) -> Result<()> {
         bail!("stdin is not a terminal; use --yes to commit or --dry-run to print");
     }
 
-    let api_key = std::env::var("GEMINI_API_KEY")
-        .ok()
-        .filter(|k| !k.trim().is_empty())
-        .context(
-            "GEMINI_API_KEY is not set (get a free key at https://aistudio.google.com/apikey)",
-        )?;
-    let base_url =
-        std::env::var("GEMINI_BASE_URL").unwrap_or_else(|_| gemini::DEFAULT_BASE_URL.to_string());
+    let file = match &config_path {
+        Some(p) => config::FileConfig::load(p)?,
+        None => config::FileConfig::default(),
+    };
+    let cfg = config::Config::resolve(cli.model.as_deref(), &file, env)?;
     let retry_ms = std::env::var("AUTOCOMMIT_RETRY_DELAY_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2000);
     let client = gemini::Client::new(
-        base_url,
-        cli.model,
-        api_key.trim().to_string(),
+        cfg.base_url,
+        cfg.model,
+        cfg.api_key,
         Duration::from_millis(retry_ms),
     );
     let generator = app::Generator::new(&client, &files);

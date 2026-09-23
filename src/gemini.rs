@@ -44,7 +44,7 @@ impl Client {
             Ok(text) => Ok(text),
             Err(Failure::Fatal(e)) => Err(e),
             Err(Failure::Retryable(first)) => {
-                eprintln!("autocommit: {first:#}; retrying in {:?}", self.retry_delay);
+                eprintln!("acm: {first:#}; retrying in {:?}", self.retry_delay);
                 sleep(self.retry_delay);
                 self.attempt(prompt).map_err(|f| match f {
                     Failure::Retryable(e) | Failure::Fatal(e) => e,

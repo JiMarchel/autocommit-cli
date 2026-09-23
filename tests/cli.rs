@@ -7,7 +7,21 @@ use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-const BIN: &str = env!("CARGO_BIN_EXE_autocommit");
+const BIN: &str = env!("CARGO_BIN_EXE_acm");
+
+/// Base command for the binary, isolated from the developer's real config.
+fn acm(dir: &Path) -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("AUTOCOMMIT_RETRY_DELAY_MS", "0")
+        .env("AUTOCOMMIT_CONFIG", dir.join(".no-such-config.yaml"))
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("GEMINI_BASE_URL")
+        .env_remove("AUTOCOMMIT_MODEL");
+    cmd
+}
 
 #[derive(Debug, Clone)]
 struct Recorded {
@@ -133,14 +147,8 @@ fn stage(dir: &Path, path: &str, content: &str) {
 }
 
 fn run(dir: &Path, mock: Option<&MockGemini>, args: &[&str]) -> Output {
-    let mut cmd = Command::new(BIN);
-    cmd.args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("AUTOCOMMIT_RETRY_DELAY_MS", "0")
-        .env("GEMINI_API_KEY", "test-key-123")
-        .env_remove("AUTOCOMMIT_MODEL");
+    let mut cmd = acm(dir);
+    cmd.args(args).env("GEMINI_API_KEY", "test-key-123");
     match mock {
         Some(m) => cmd.env("GEMINI_BASE_URL", &m.url),
         // Nothing listens here: any request fails fast.
@@ -263,15 +271,156 @@ fn outside_git_repo_fails() {
 fn missing_api_key_is_a_clear_error() {
     let dir = repo();
     stage(dir.path(), "src/a.rs", "x\n");
-    let out = Command::new(BIN)
+    let out = acm(dir.path())
         .arg("--dry-run")
-        .current_dir(dir.path())
-        .env_remove("GEMINI_API_KEY")
         .env("GEMINI_BASE_URL", "http://127.0.0.1:9")
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("GEMINI_API_KEY"), "{}", stderr(&out));
+}
+
+fn write_config(dir: &Path, text: &str, mode: u32) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("cfg").join("config.yaml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    path
+}
+
+#[test]
+fn config_file_supplies_key_model_and_url() {
+    let dir = repo();
+    stage(dir.path(), "src/a.rs", "x\n");
+    let mock = MockGemini::start(vec![ok("fix: handle x")]);
+    let cfg = tempfile::tempdir().unwrap();
+    let path = write_config(
+        cfg.path(),
+        &format!(
+            "api_key: file-key-456\nmodel: file-model\nbase_url: {}\n",
+            mock.url
+        ),
+        0o600,
+    );
+
+    let out = acm(dir.path())
+        .arg("--dry-run")
+        .env("AUTOCOMMIT_CONFIG", &path)
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    let r = &mock.requests()[0];
+    assert_eq!(r.header("x-goog-api-key"), Some("file-key-456"));
+    assert!(
+        r.request_line.contains("/models/file-model:"),
+        "{}",
+        r.request_line
+    );
+    assert!(!stderr(&out).contains("readable"), "{}", stderr(&out));
+}
+
+#[test]
+fn env_and_flag_override_config_file() {
+    let dir = repo();
+    stage(dir.path(), "src/a.rs", "x\n");
+    let mock = MockGemini::start(vec![ok("fix: handle x")]);
+    let cfg = tempfile::tempdir().unwrap();
+    let path = write_config(
+        cfg.path(),
+        "api_key: file-key\nmodel: file-model\nbase_url: http://127.0.0.1:9\n",
+        0o600,
+    );
+
+    let out = acm(dir.path())
+        .args(["--dry-run", "--model", "flag-model"])
+        .env("AUTOCOMMIT_CONFIG", &path)
+        .env("GEMINI_API_KEY", "env-key")
+        .env("GEMINI_BASE_URL", &mock.url)
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    let r = &mock.requests()[0];
+    assert_eq!(r.header("x-goog-api-key"), Some("env-key"));
+    assert!(
+        r.request_line.contains("/models/flag-model:"),
+        "{}",
+        r.request_line
+    );
+}
+
+#[test]
+fn world_readable_config_warns() {
+    let dir = repo();
+    stage(dir.path(), "src/a.rs", "x\n");
+    let mock = MockGemini::start(vec![ok("fix: handle x")]);
+    let cfg = tempfile::tempdir().unwrap();
+    let path = write_config(
+        cfg.path(),
+        &format!("api_key: file-key\nbase_url: {}\n", mock.url),
+        0o644,
+    );
+
+    let out = acm(dir.path())
+        .arg("--dry-run")
+        .env("AUTOCOMMIT_CONFIG", &path)
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("chmod 600"), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("file-key"));
+}
+
+#[test]
+fn invalid_config_is_a_clear_error() {
+    let dir = repo();
+    stage(dir.path(), "src/a.rs", "x\n");
+    let cfg = tempfile::tempdir().unwrap();
+    let path = write_config(cfg.path(), "apikey: oops\n", 0o600);
+
+    let out = acm(dir.path())
+        .arg("--dry-run")
+        .env("AUTOCOMMIT_CONFIG", &path)
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(
+        err.contains("config.yaml") && err.contains("apikey"),
+        "{err}"
+    );
+}
+
+#[test]
+fn init_writes_private_config_template() {
+    let cfg = tempfile::tempdir().unwrap();
+    let path = cfg.path().join("sub").join("config.yaml");
+
+    let out = acm(cfg.path())
+        .arg("--init")
+        .env("AUTOCOMMIT_CONFIG", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("api_key:"), "{text}");
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+
+    // Never overwrite an existing config.
+    std::fs::write(&path, "api_key: mine\n").unwrap();
+    let out = acm(cfg.path())
+        .arg("--init")
+        .env("AUTOCOMMIT_CONFIG", &path)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "api_key: mine\n");
 }
 
 #[test]
